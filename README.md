@@ -27,6 +27,10 @@ tests/                  重复消费 / 位点回退 / 结构变更 / 并发触�
 | GET | `/sources/{source}/schema` | 查询目标 schema |
 | GET | `/sources/{source}/rows` | 查询目标数据 |
 | GET | `/sources/{source}/rejections` | 查询死信（含失败原因与原始记录） |
+| GET | `/sources/{source}/dead-letters` | 分页查询失败记录：`?reason=&status=&limit=&offset=` |
+| GET | `/dead-letters/{id}` | 单条失败记录详情（含处置状态与重放流水） |
+| POST | `/dead-letters/{id}/status` | 标注处置状态：`{"status": "pending|resolved|ignored", "note": "..."}` |
+| POST | `/sources/{source}/replay` | 受控重放一小批失败记录：`{"ids": [1, 2, ...]}` |
 
 变更记录字段：`position`（源端单调递增位点）、`op`（`insert`/`update`/`delete`）、
 `pk`（主键字典）、`payload`（整行数据，delete 可省略）。
@@ -57,6 +61,36 @@ tests/                  重复消费 / 位点回退 / 结构变更 / 并发触�
   标记为 `incompatible_schema_change`，可追溯。
 - 结构变更同样按位点幂等：同一变更重复投递不会重复应用。
 
+## 失败记录处置与受控重放
+
+### 处置规则
+
+- 每条被拒绝的记录在死信表中有唯一 `id`，可单独定位（`GET /dead-letters/{id}`），
+  并按数据源、失败原因（`reason`）、处置状态（`status`）组合筛选。
+- 处置状态三态流转：`pending`（待处理）→ `resolved`（已解决）/ `ignored`（已忽略），
+  标注时记录处置时间（`updated_at`）与处理说明（`resolution_note`）。
+- 列表查询强制分页（`limit`/`offset`，`limit` 上限 500），返回 `total` 与当前页，
+  不会一次性把全部失败记录读入内存。
+
+### 受控重放与位点、并发的关系
+
+- **重放走与正常接入完全相同的校验与写入语义**：能过的过，该拒的仍按可区分原因
+  明确拒绝（结果写回原死信的 `replay_outcome`/`replay_reason`）；INSERT 命中已存在
+  主键照样拒绝，绝不悄悄覆盖已有数据。
+- **与位点的关系**：记录首次被拒时其位点已推进并落入 `applied_positions`，因此
+  重放**不查位点、不推进 checkpoint、不改 `applied_positions`**——重放只是补写数据，
+  位点语义保持不变；重放也不会被"位点回退"规则误拒。
+- **重放幂等**：幂等键是死信自身的 `replay_outcome`。已成功重放（`applied`）的记录
+  再次重放直接幂等跳过（`already_applied`），不产生重复数据、不改变状态；
+  有界重试的每次尝试前都会重读死信状态，跨尝试同样幂等。
+- **并发**：重放按数据源分组，复用与正常接入相同的 per-source 锁，二者互斥、
+  组内按位点升序推进；不同数据源的接入与重放互不阻塞，单个数据源的重放失败
+  不影响其他数据源。
+- **错误处理**：重放过程中的可恢复错误沿用与接入相同的有界退避重试
+  （`max_retries`/`backoff_seconds`），不可恢复错误直接失败，不做无界重试。
+- **可追溯**：每次重放（无论成功/拒绝/跳过）都写入 `replay_history` 流水，
+  原死信上能看到最终处置结果、重放次数与最近一次重放时间。
+
 ## 可配置项
 
 `PipelineConfig`（见 `ingestion/pipeline.py`）：
@@ -65,6 +99,7 @@ tests/                  重复消费 / 位点回退 / 结构变更 / 并发触�
 | --- | --- | --- |
 | `max_retries` | 3 | 可恢复错误的最大重试次数（有界） |
 | `backoff_seconds` | 0.05 | 退避基数，按尝试次数线性增长 |
+| `max_replay_batch` | 100 | 单次重放请求允许的最大死信条数（超出返回 400） |
 
 服务数据文件路径通过环境变量 `INGESTION_DB` 配置（默认 `./ingestion.db`）。
 
@@ -80,4 +115,24 @@ uv run python main.py   # 本地启动服务（127.0.0.1，随机端口）
 测试覆盖：重复消费与重启恢复（`test_idempotency.py`）、位点回退与可区分失败原因
 （`test_rejection.py`）、结构变更兼容与可追溯失败（`test_schema_evolution.py`）、
 同一数据源并发触发 / 数据源间隔离 / 有界重试（`test_concurrency.py`）、
-HTTP 端到端协议（`test_api.py`）。
+失败记录处置状态流转与受控重放（`test_replay.py`）、HTTP 端到端协议（`test_api.py`）。
+
+### 本地验证失败处置与重放
+
+```bash
+uv run pytest tests/test_replay.py -v   # 处置流转 / 重放幂等 / 再拒绝 / 并发互斥
+uv run python main.py &                 # 启动本地服务
+
+# 1. 造一条被拒绝的记录（name 类型不匹配）
+curl -X POST localhost:8000/sources/users/init -d '{"columns": {"id": "int", "name": "str"}}'
+curl -X POST localhost:8000/sources/users/ingest \
+  -d '{"records": [{"position": 1, "op": "insert", "pk": {"id": 1}, "payload": {"id": 1, "name": 7}}]}'
+
+# 2. 分页查询失败记录并标注处置状态
+curl 'localhost:8000/sources/users/dead-letters?reason=type_mismatch&limit=10'
+curl -X POST localhost:8000/dead-letters/1/status -d '{"status": "ignored", "note": "确认作废"}'
+
+# 3. 修好源端数据后发起重放，查看重放结果与流水
+curl -X POST localhost:8000/sources/users/replay -d '{"ids": [1]}'
+curl localhost:8000/dead-letters/1
+```

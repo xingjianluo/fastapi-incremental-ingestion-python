@@ -30,6 +30,23 @@ class ErrorKind(str, enum.Enum):
     UNRECOVERABLE = "unrecoverable"  # 不可恢复：直接判失败
 
 
+class DeadLetterStatus(str, enum.Enum):
+    """失败记录的处置状态。"""
+
+    PENDING = "pending"    # 待处理
+    RESOLVED = "resolved"  # 已解决（重放成功或人工确认）
+    IGNORED = "ignored"    # 已忽略（确认不再处理）
+
+
+class ReplayOutcome(str, enum.Enum):
+    """单次重放的结果。"""
+
+    APPLIED = "applied"                  # 重放校验通过并成功应用
+    REJECTED = "rejected"                # 重放后仍被明确拒绝（原因可区分）
+    ALREADY_APPLIED = "already_applied"  # 此前已重放成功，幂等跳过
+    NOT_FOUND = "not_found"              # 死信记录不存在
+
+
 @dataclass(frozen=True)
 class ChangeRecord:
     """一条源端变更。"""
@@ -75,3 +92,52 @@ class IngestResult:
     rejected: list[Rejection] = field(default_factory=list)
     last_position: int = 0
     attempts: int = 1
+
+
+@dataclass
+class DeadLetter:
+    """一条可单独定位、可处置、可重放的失败记录。"""
+
+    id: int
+    source: str
+    position: int
+    reason: FailureReason
+    detail: str
+    record: dict[str, Any]
+    status: DeadLetterStatus = DeadLetterStatus.PENDING
+    created_at: str = ""
+    updated_at: str = ""
+    resolution_note: str = ""
+    replay_outcome: ReplayOutcome | None = None  # 最近一次重放的结果
+    replay_reason: str = ""    # 重放仍被拒时的可区分原因
+    replay_detail: str = ""
+    replayed_at: str = ""
+    replay_attempts: int = 0
+
+
+@dataclass
+class ReplayItemResult:
+    """单条死信的重放结果。"""
+
+    dead_letter_id: int
+    source: str = ""
+    position: int = 0
+    outcome: ReplayOutcome = ReplayOutcome.NOT_FOUND
+    reason: str = ""    # 重放被拒时的 FailureReason 值
+    detail: str = ""
+
+
+@dataclass
+class ReplayResult:
+    """一小批死信的重放汇总。"""
+
+    results: list[ReplayItemResult] = field(default_factory=list)
+    attempts: int = 1
+
+    @property
+    def applied(self) -> int:
+        return sum(1 for r in self.results if r.outcome is ReplayOutcome.APPLIED)
+
+    @property
+    def rejected(self) -> int:
+        return sum(1 for r in self.results if r.outcome is ReplayOutcome.REJECTED)

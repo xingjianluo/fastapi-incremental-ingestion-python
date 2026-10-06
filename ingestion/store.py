@@ -15,7 +15,15 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import ChangeRecord, Op, Rejection
+from .models import (
+    ChangeRecord,
+    DeadLetter,
+    DeadLetterStatus,
+    FailureReason,
+    Op,
+    Rejection,
+    ReplayOutcome,
+)
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -48,7 +56,29 @@ CREATE TABLE IF NOT EXISTS dead_letters (
     record TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS replay_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dead_letter_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    replayed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
+
+# 老库升级：为 dead_letters 补充处置与重放字段（幂等，可重复执行）
+_DEAD_LETTER_MIGRATIONS = (
+    "ALTER TABLE dead_letters ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE dead_letters ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE dead_letters ADD COLUMN resolution_note TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE dead_letters ADD COLUMN replay_outcome TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE dead_letters ADD COLUMN replay_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE dead_letters ADD COLUMN replay_detail TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE dead_letters ADD COLUMN replayed_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE dead_letters ADD COLUMN replay_attempts INTEGER NOT NULL DEFAULT 0",
+)
 
 
 def canonical_pk(pk: dict[str, Any]) -> str:
@@ -60,7 +90,7 @@ def _locked(fn):
     """串行化对共享连接的访问（可重入）。"""
 
     @functools.wraps(fn)
-    def wrapper(self: "Store", *args, **kwargs):
+    def wrapper(self: Store, *args, **kwargs):
         with self._mu:
             return fn(self, *args, **kwargs)
 
@@ -84,7 +114,20 @@ class Store:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA busy_timeout=5000")
                 self._conn.executescript(_SCHEMA_SQL)
+                self._migrate()
             return self._conn
+
+    def _migrate(self) -> None:
+        """老库结构升级：缺失列逐条补齐，已存在则跳过。"""
+        assert self._conn is not None
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(dead_letters)")
+        }
+        for stmt in _DEAD_LETTER_MIGRATIONS:
+            column = stmt.split("ADD COLUMN", 1)[1].strip().split()[0]
+            if column not in existing:
+                self._conn.execute(stmt)
 
     def close(self) -> None:
         with self._mu:
@@ -239,3 +282,162 @@ class Store:
             "SELECT row FROM target_rows WHERE source = ? ORDER BY pk", (source,)
         ).fetchall()
         return [json.loads(r[0]) for r in rows]
+
+    # ---- 死信处置与重放 ----
+    @staticmethod
+    def _to_dead_letter(row: tuple) -> DeadLetter:
+        (dl_id, source, position, reason, detail, record, created_at,
+         status, updated_at, note, replay_outcome, replay_reason,
+         replay_detail, replayed_at, replay_attempts) = row
+        return DeadLetter(
+            id=dl_id, source=source, position=position,
+            reason=FailureReason(reason), detail=detail,
+            record=json.loads(record), created_at=created_at,
+            status=DeadLetterStatus(status), updated_at=updated_at,
+            resolution_note=note,
+            replay_outcome=ReplayOutcome(replay_outcome) if replay_outcome else None,
+            replay_reason=replay_reason, replay_detail=replay_detail,
+            replayed_at=replayed_at, replay_attempts=replay_attempts,
+        )
+
+    _DEAD_LETTER_COLS = (
+        "id, source, position, reason, detail, record, created_at, status,"
+        " updated_at, resolution_note, replay_outcome, replay_reason,"
+        " replay_detail, replayed_at, replay_attempts"
+    )
+
+    @_locked
+    def get_dead_letter(self, dead_letter_id: int) -> DeadLetter | None:
+        row = self.connect().execute(
+            f"SELECT {self._DEAD_LETTER_COLS} FROM dead_letters WHERE id = ?",
+            (dead_letter_id,),
+        ).fetchone()
+        return self._to_dead_letter(row) if row else None
+
+    @_locked
+    def list_dead_letters(
+        self,
+        source: str | None = None,
+        reason: FailureReason | None = None,
+        status: DeadLetterStatus | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[DeadLetter], int]:
+        """按条件分页查询死信；返回 (本页记录, 总条数)，避免全量读入。"""
+        where, params = [], []
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        if reason is not None:
+            where.append("reason = ?")
+            params.append(reason.value)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status.value)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        conn = self.connect()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM dead_letters{clause}", params
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT {self._DEAD_LETTER_COLS} FROM dead_letters{clause}"
+            " ORDER BY id LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [self._to_dead_letter(r) for r in rows], int(total)
+
+    @_locked
+    def update_dead_letter_status(
+        self, dead_letter_id: int, status: DeadLetterStatus, note: str = ""
+    ) -> DeadLetter | None:
+        """标注处置状态，记录处置时间与说明。"""
+        conn = self.connect()
+        cur = conn.execute(
+            "UPDATE dead_letters SET status = ?, resolution_note = ?,"
+            " updated_at = datetime('now') WHERE id = ?",
+            (status.value, note, dead_letter_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        return self.get_dead_letter(dead_letter_id)
+
+    @_locked
+    def apply_replay(self, dead_letter: DeadLetter, record: ChangeRecord) -> None:
+        """重放成功：单事务写目标行 + 更新死信状态 + 记重放流水。
+
+        不推进 checkpoint、不改 applied_positions：该位点在首次拒绝时已
+        推进并落账，重放只是补写数据，位点语义保持不变。
+        """
+        conn = self.connect()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            pk = canonical_pk(record.pk)
+            if record.op is Op.DELETE:
+                conn.execute(
+                    "DELETE FROM target_rows WHERE source = ? AND pk = ?",
+                    (record.source, pk),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO target_rows (source, pk, row) VALUES (?, ?, ?)"
+                    " ON CONFLICT (source, pk) DO UPDATE SET row = excluded.row",
+                    (record.source, pk,
+                     json.dumps(record.payload, ensure_ascii=False)),
+                )
+            conn.execute(
+                "UPDATE dead_letters SET status = ?, replay_outcome = ?,"
+                " replay_reason = '', replay_detail = '',"
+                " replayed_at = datetime('now'), updated_at = datetime('now'),"
+                " replay_attempts = replay_attempts + 1 WHERE id = ?",
+                (DeadLetterStatus.RESOLVED.value, ReplayOutcome.APPLIED.value,
+                 dead_letter.id),
+            )
+            conn.execute(
+                "INSERT INTO replay_history (dead_letter_id, source, position,"
+                " outcome) VALUES (?, ?, ?, ?)",
+                (dead_letter.id, dead_letter.source, dead_letter.position,
+                 ReplayOutcome.APPLIED.value),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    @_locked
+    def record_replay_rejection(
+        self, dead_letter: DeadLetter, reason: FailureReason, detail: str
+    ) -> None:
+        """重放仍被拒：单事务更新死信（保持待处理）+ 记重放流水。"""
+        conn = self.connect()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE dead_letters SET status = ?, replay_outcome = ?,"
+                " replay_reason = ?, replay_detail = ?,"
+                " replayed_at = datetime('now'), updated_at = datetime('now'),"
+                " replay_attempts = replay_attempts + 1 WHERE id = ?",
+                (DeadLetterStatus.PENDING.value, ReplayOutcome.REJECTED.value,
+                 reason.value, detail, dead_letter.id),
+            )
+            conn.execute(
+                "INSERT INTO replay_history (dead_letter_id, source, position,"
+                " outcome, reason, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                (dead_letter.id, dead_letter.source, dead_letter.position,
+                 ReplayOutcome.REJECTED.value, reason.value, detail),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    @_locked
+    def list_replay_history(self, dead_letter_id: int) -> list[dict[str, Any]]:
+        rows = self.connect().execute(
+            "SELECT outcome, reason, detail, replayed_at FROM replay_history"
+            " WHERE dead_letter_id = ? ORDER BY id",
+            (dead_letter_id,),
+        ).fetchall()
+        return [
+            {"outcome": o, "reason": r, "detail": d, "replayed_at": t}
+            for o, r, d, t in rows
+        ]

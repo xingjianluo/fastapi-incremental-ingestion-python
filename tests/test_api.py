@@ -62,3 +62,44 @@ def test_schema_change_over_http(client):
     logger.info("schema rejections: %s", rej)
     assert rej[0]["reason"] == "incompatible_schema_change"
     assert rej[0]["record"]["drop_columns"] == ["name"]
+
+
+def test_dead_letter_triage_and_replay_over_http(client):
+    """HTTP 端到端：死信筛选/标注/分页 + 受控重放。"""
+    client.post("/sources/users/init",
+                json={"columns": {"id": "int", "name": "str"}})
+    client.post("/sources/users/ingest", json={"records": [
+        {"position": p, "op": "insert", "pk": {"id": p},
+         "payload": {"id": p, "name": p}} for p in range(1, 4)]})  # 3 条全拒
+
+    # 分页 + 按原因筛选
+    r = client.get("/sources/users/dead-letters",
+                   params={"reason": "type_mismatch", "limit": 2, "offset": 0})
+    body = r.json()
+    logger.info("dead-letters page: total=%d items=%d", body["total"],
+                len(body["items"]))
+    assert body["total"] == 3 and len(body["items"]) == 2
+    dl_id = body["items"][0]["id"]
+    assert body["items"][0]["status"] == "pending"
+
+    # 单条定位 + 标注处置状态
+    r = client.post(f"/dead-letters/{dl_id}/status",
+                    json={"status": "ignored", "note": "确认作废"})
+    assert r.json()["dead_letter"]["status"] == "ignored"
+    r = client.get("/sources/users/dead-letters",
+                   params={"status": "pending"})
+    assert r.json()["total"] == 2
+
+    # 重放未修复的记录：仍被明确拒绝
+    r = client.post("/sources/users/replay", json={"ids": [dl_id]})
+    item = r.json()["results"][0]
+    logger.info("http replay: %s", item)
+    assert item["outcome"] == "rejected"
+    assert item["reason"] == "type_mismatch"
+
+    # 单条详情含重放流水
+    r = client.get(f"/dead-letters/{dl_id}")
+    assert r.json()["replay_history"][0]["outcome"] == "rejected"
+    assert r.json()["dead_letter"]["replay_attempts"] == 1
+
+    assert client.get("/dead-letters/9999").status_code == 404
