@@ -15,8 +15,8 @@ import logging
 import sqlite3
 import threading
 import time
-from typing import Any
 
+from .locks import SourceLockRegistry
 from .models import (
     ChangeRecord,
     ErrorKind,
@@ -35,11 +35,19 @@ logger = logging.getLogger("ingestion.pipeline")
 class PipelineConfig:
     """可配置项。"""
 
-    def __init__(self, max_retries: int = 3, backoff_seconds: float = 0.05) -> None:
+    def __init__(
+        self,
+        max_retries: int = 3,
+        backoff_seconds: float = 0.05,
+        max_replay_batch_size: int = 100,
+    ) -> None:
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
+        if max_replay_batch_size <= 0:
+            raise ValueError("max_replay_batch_size must be > 0")
         self.max_retries = max_retries          # 可恢复错误的最大重试次数（有界）
         self.backoff_seconds = backoff_seconds  # 退避基数，按尝试次数线性增长
+        self.max_replay_batch_size = max_replay_batch_size  # 单次重放条目上限（有界）
 
 
 def classify_error(exc: Exception) -> ErrorKind:
@@ -49,23 +57,59 @@ def classify_error(exc: Exception) -> ErrorKind:
     return ErrorKind.UNRECOVERABLE
 
 
+def validate_record(
+    store: Store, rec: ChangeRecord, columns: dict[str, str]
+) -> Rejection | None:
+    """与正常接入完全一致的逐条校验；返回 None 表示通过。
+
+    受控重放必须复用本函数，确保走重放也不会放行本该拒绝的记录。
+    """
+    if not rec.pk:
+        return IngestionPipeline._reject(rec, FailureReason.MISSING_PRIMARY_KEY,
+                                         "primary key is empty")
+    if rec.op is Op.INSERT and store.row_exists(rec.source, rec.pk):
+        return IngestionPipeline._reject(rec, FailureReason.PRIMARY_KEY_CONFLICT,
+                                         f"primary key {rec.pk} already exists")
+    if rec.op is not Op.DELETE:
+        for name in columns:
+            if name not in rec.payload:
+                return IngestionPipeline._reject(
+                    rec, FailureReason.MISSING_FIELD,
+                    f"column {name!r} missing in payload")
+        for name, value in rec.payload.items():
+            if name not in columns:
+                return IngestionPipeline._reject(
+                    rec, FailureReason.UNKNOWN_COLUMN,
+                    f"column {name!r} not in target schema")
+            if not value_matches(columns[name], value):
+                return IngestionPipeline._reject(
+                    rec, FailureReason.TYPE_MISMATCH,
+                    f"column {name!r} expects {columns[name]}, got {value!r}")
+    return None
+
+
 class IngestionPipeline:
     """按数据源互斥、幂等地应用变更。"""
 
-    def __init__(self, store: Store, schema: SchemaManager, config: PipelineConfig) -> None:
+    def __init__(
+        self,
+        store: Store,
+        schema: SchemaManager,
+        config: PipelineConfig,
+        locks: SourceLockRegistry | None = None,
+    ) -> None:
         self._store = store
         self._schema = schema
         self._config = config
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
+        self._locks = locks or SourceLockRegistry()
 
-    def _lock_for(self, source: str) -> threading.Lock:
-        with self._locks_guard:
-            return self._locks.setdefault(source, threading.Lock())
+    def lock_for(self, source: str) -> threading.Lock:
+        """同一数据源的正常接入 / 结构变更 / 受控重放共用这把锁。"""
+        return self._locks.get(source)
 
     # ---- 变更数据接入 ----
     def ingest(self, source: str, records: list[ChangeRecord]) -> IngestResult:
-        with self._lock_for(source):  # 同一数据源互斥
+        with self.lock_for(source):  # 同一数据源互斥
             return self._with_retry(source, records)
 
     def _with_retry(self, source: str, records: list[ChangeRecord]) -> IngestResult:
@@ -132,26 +176,7 @@ class IngestionPipeline:
         return result
 
     def _validate(self, rec: ChangeRecord, columns: dict[str, str]) -> Rejection | None:
-        if not rec.pk:
-            return self._reject(rec, FailureReason.MISSING_PRIMARY_KEY,
-                                "primary key is empty")
-        if rec.op is Op.INSERT and self._store.row_exists(rec.source, rec.pk):
-            return self._reject(rec, FailureReason.PRIMARY_KEY_CONFLICT,
-                                f"primary key {rec.pk} already exists")
-        if rec.op is not Op.DELETE:
-            for name in columns:
-                if name not in rec.payload:
-                    return self._reject(rec, FailureReason.MISSING_FIELD,
-                                        f"column {name!r} missing in payload")
-            for name, value in rec.payload.items():
-                if name not in columns:
-                    return self._reject(rec, FailureReason.UNKNOWN_COLUMN,
-                                        f"column {name!r} not in target schema")
-                if not value_matches(columns[name], value):
-                    return self._reject(
-                        rec, FailureReason.TYPE_MISMATCH,
-                        f"column {name!r} expects {columns[name]}, got {value!r}")
-        return None
+        return validate_record(self._store, rec, columns)
 
     @staticmethod
     def _reject(rec: ChangeRecord, reason: FailureReason, detail: str) -> Rejection:
@@ -166,7 +191,7 @@ class IngestionPipeline:
 
     # ---- 结构变更接入 ----
     def apply_schema_change(self, change: SchemaChange) -> None:
-        with self._lock_for(change.source):
+        with self.lock_for(change.source):
             checkpoint = self._store.get_checkpoint(change.source)
             if change.position <= checkpoint and self._store.is_position_applied(
                 change.source, change.position
